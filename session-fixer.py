@@ -92,6 +92,8 @@ def count_transcript_tokens(session_id: str) -> tuple[int, int]:
 def main():
     parser = argparse.ArgumentParser(description="Fix stale spawn-child session token counts")
     parser.add_argument("--dry-run", action="store_true", help="Preview only")
+    parser.add_argument("--no-am", action="store_true",
+                        help="Skip AgentMemory archive (store-only mode)")
     parser.add_argument("--aggressive", action="store_true",
                         help="Also remove stale subagent entries >24h")
     parser.add_argument("--hours", type=int, default=12,
@@ -185,6 +187,10 @@ def main():
                 fixed += 1
 
             if not args.dry_run:
+                # Save to AgentMemory before mutating store
+                if not args.no_am:
+                    _save_to_am(action, key, session, reason, actual_total)
+
                 if action == "remove":
                     # Also delete transcript files
                     pattern = os.path.join(SESSIONS_DIR, f"*{session_id}*")
@@ -228,6 +234,48 @@ def main():
         print(f"{'='*60}")
 
     return 0
+
+def _save_to_am(action, key, session, reason, actual_total):
+    """Save archive/fix record to AgentMemory before mutating store."""
+    import subprocess
+    sid = session.get("sessionId", "")[:16]
+    total_tokens = session.get("totalTokens", 0) or 0
+    context_tokens = session.get("contextTokens", 1000000) or 1000000
+    age_ms = int(time.time() * 1000) - (session.get("updatedAt", 0) or 0)
+    age_h = round(age_ms / 3600000, 1)
+    pct = round(total_tokens / context_tokens * 100, 1) if context_tokens else 0
+    model = session.get("model", "?")
+    topic = session.get("spawnedBy", "") or key.split(":")[-1][:16]
+
+    content = (
+        f"session-fixer: {action} of spawn-child subagent\n"
+        f"  Key: {key}\n"
+        f"  Session ID: {sid}\n"
+        f"  Reason: {reason}\n"
+        f"  Age: {age_h}h\n"
+        f"  Tokens: {total_tokens:,} / {context_tokens:,} ({pct}%)\n"
+        f"  Model: {model}\n"
+    )
+
+    try:
+        result = subprocess.run(
+            ["curl", "-s", "-X", "POST",
+             "http://localhost:3111/agentmemory/remember",
+             "-H", "Content-Type: application/json",
+             "-d", json.dumps({
+                 "content": content,
+                 "project": "clawsession",
+                 "type": "archive",
+                 "concepts": f"session-fixer,{action},spawn-child,sid-{sid}"
+             })],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            print(f"     📝 AM archived")
+        else:
+            print(f"     ⚠️  AM write failed: {result.stderr[:100]}")
+    except Exception as e:
+        print(f"     ⚠️  AM write error: {e}")
 
 if __name__ == "__main__":
     exit(main())
